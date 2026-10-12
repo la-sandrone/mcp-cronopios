@@ -236,6 +236,10 @@ def add_equation(expr_str: str) -> str:
 def solve(target_vars: Optional[list[str]] = None) -> str:
     """求解当前方程组。
 
+    ⚠️ 含符号变量的推导（展开 / 化简 / 因式分解 / 求导 / 积分 / 解方程 / 恒等式验证）
+    请走本服务器，不要在思考里手推——手推会累积误差且无法自检。
+    需要精确解时用它，不要手算。
+
     自动检测:
       · 线性方程组 → linsolve（精确解）
       · 非线性方程组 → nonlinsolve

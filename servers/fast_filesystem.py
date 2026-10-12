@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP filesystem server — precise, fast, safe.  v4.7
+MCP filesystem server — precise, fast, safe.  v4.8
 
 v4.0 墓碑删除体系 (FAT32‑inspired tombstone + GC)
 ─────────────────────────────────────────────────
@@ -27,6 +27,30 @@ Design principles (inherited from v3.x):
   - Two-phase confirmation for destructive writes
   - Newline preservation: 萧规曹随 (follow original file style, empty → LF)
   - ALL tool names carry 'cronopio_' prefix — prevents confusion with AI client built-ins
+
+行号口径 (v4.8) — 按工具名对齐上游，不强行统一
+──────────────────────────────────────────────────────────────
+  原则：**工具名就是接口契约**。叫 grep 的就按 grep 的口径，叫 read/write 的
+  按数组索引的口径。模型对同名工具有极强的条件反射式先验，扭曲它 =
+  制造"名字承诺 A、行为交付 B"的陷阱。
+
+  1) 报告行号（给人看、给 grep 生态比对）→ **1-based，对齐上游 grep**
+       cronopio_grep / cronopio_grepdir / cronopio_scan
+       · 实测口径依据：GNU grep 3.12 对第 3 行输出 `3:charlie`；rg 15.2 同为 `3:`；
+         sed 行地址 / awk NR / perl $. / gcc 诊断行号，一律 1-based。
+       · scan 的 `detail_lines` 输入参数**同为 1-based**——输出里看到的行号
+         可原样填回，零换算。
+
+  2) 行索引参数（当索引用、进数组）→ **0-based，对齐 C/C++ 数组**
+       read 的 offset_lines / write 的 at_line：第一行 = 0，负数从尾倒数。
+       这些值经 _resolve_line_offset 直接成为 `lines[i]` 的 i。
+       给它们套 1-based 会破坏真实索引语义，故**不动**。
+
+  ⚠️ 混合口径的使用注意：
+    · grep/scan 报的行号 → 直接喂 cronopio_grep / scan 的 detail_lines：**零换算**
+    · grep/scan 报的行号 → 喂 read 的 offset_lines / write 的 at_line：**需要 -1**
+    · 内部实现全部 0-based（Python 列表下标），1-based 只在**对外输出/输入**处 ±1。
+      兑换点集中在少数几行，有回归网逐条守着。
 
 Tools (v4.0):
   cronopio_find     — glob search with dir/recursive/max_depth control
@@ -89,6 +113,7 @@ import zipfile
 import tempfile
 import contextlib
 import asyncio; import re
+import sys
 import unicodedata
 from datetime import datetime, timezone
 
@@ -252,6 +277,15 @@ _NO_BOM_FALLBACK = 'gb18030'
 _UTF8_VALIDATE_CAP = 4 * 1024 * 1024
 # 换行探测窗口（v4.7 从 8KB 提上来：首行 >8KB 的 CRLF 文件此前会被误判为 LF）
 _NL_PROBE_MAX = 1024 * 1024
+
+# ── zstd 读取（v4.8）────────────────────────────────────────────
+# 后端优先级：zstd/zstdcat CLI（自文档、不引入 import 副作用）
+#            → zstandard 模块（**实测本机 3.12 venv 已装**；标准库 compression.zstd 需 3.14+）
+#            → 都没有则 fail-loud（绝不当成未压缩文件静默读出二进制垃圾）
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"          # zstd 帧魔数（小端 0xFD2FB528）
+_ZSTD_PY_CHUNK = 1 << 16                    # 回退路径的分块粒度，避免一次性物化整个解压结果
+# zstandard 无此属性名的老版本会在调用「返回整块」的 API 时只读首帧——
+# 那是多帧文件（DSH 会话日志就是多帧）最典型的坑，详见 _zstd_read_python 的注释。
 
 
 def _get_tombstone_byte(encoding: str) -> bytes:
@@ -800,6 +834,30 @@ def _convert_v1(arguments: dict) -> list[TextContent]:
 
 # ── File I/O with tombstone awareness ──
 
+def _split_lines_exact(raw: bytes, nl_bytes: bytes) -> list[bytes]:
+    """按换行字节切行，**丢弃「尾换行切出的空尾元素」**（幽灵行）。
+
+    raw.split(nl) 对「以换行符结尾」的文件会多切出一个 b""：
+    10 行的文件 -> 11 个元素。那是坐标网格线的产物，不是内容行
+    ——readlines() / splitlines() 都不计它，行数会凭空多 1。
+
+    对坐标系的两个危害（实测）：
+      · read/grep 自报「共 11 行」，与 write 路径（readlines()=10）**口径打架**
+      · 幽灵行能被搜到：query='^$' 会命中它，还带 at_line=10 的合法写入目标
+
+    保留语义边界：
+      · b""      -> []            （空文件 = 0 行）
+      · b"a\\n"   -> [b"a"]        （1 行）
+      · b"\\n"    -> [b""]         （1 个空行）
+      · b"a"     -> [b"a"]        （无尾换行，原样）
+    仅剥一个空尾元素；文件真的以「空行」结尾时（b"a\\n\\n" -> [b"a", b""]）不受影响。
+    """
+    out = raw.split(nl_bytes)
+    if len(out) > 1 and out[-1] == b"":
+        out.pop()
+    return out
+
+
 def _read_file_with_tombstones(path: str) -> tuple[list[str], str, bool, int, int]:
     """Read *path*, rendering tombstone lines as '[DELETED]' + newline.
 
@@ -810,6 +868,10 @@ def _read_file_with_tombstones(path: str) -> tuple[list[str], str, bool, int, in
     v4.7：行首 BOM **从显示里剥掉**（否则第一行会带一个隐形 U+FEFF，read/grep/scan
     全被它污染）。只影响显示——剥 BOM 不改变换行数量，行号坐标系不变；
     写路径（delete_lines / gc）走 _read_raw_lines，BOM 原样保留。
+
+    v4.8：行切分改走 _split_lines_exact，**不再切出尾换行导致的幽灵空行**
+    （10 行文件过去报 11 行，且 '^$' 能搜到那个幽灵行）。total_lines 现与
+    readlines()/splitlines() 一致，也与 write 路径（readlines()）同一坐标系。
 
     Returns:
         display_lines   — list of decoded lines (tombstones → '[DELETED]\n')
@@ -830,7 +892,7 @@ def _read_file_with_tombstones(path: str) -> tuple[list[str], str, bool, int, in
         raw = raw[len(bom):]          # 见 docstring：剥掉行首 BOM，只影响显示
 
     nl_bytes = nl_text.encode(enc)
-    raw_lines = raw.split(nl_bytes)
+    raw_lines = _split_lines_exact(raw, nl_bytes)
 
     display_lines: list[str] = []
     tombstone_count = 0
@@ -872,11 +934,18 @@ def _read_raw_lines(path: str, enc: str, nl_text: str) -> list[bytes]:
     """Read *path* as raw bytes, split by newline bytes (no decoding).
 
     Returns list of raw line bytes (newline stripped from each).
+
+    v4.8：走 _split_lines_exact，**不再多出尾换行切出的空尾元素**——否则
+    delete_lines 的 at_line 索引空间会比 read/grep 报出的行号多一行，
+    两个坐标系错位（反向 off-by-one）。
+
+    调用方若要把结果 join 回文件，**必须自己补回尾换行**（见 delete_lines / gc）：
+    本函数只保证"行内容"清单，尾换行的形状由调用方显式重建。
     """
     with open(path, "rb") as fh:
         raw = fh.read()
     nl_bytes = nl_text.encode(enc)
-    return raw.split(nl_bytes)
+    return _split_lines_exact(raw, nl_bytes)
 
 
 def _resolve_line_offset(total_lines: int, offset_lines: int, *, clamp_to: str = "start") -> int:
@@ -1059,7 +1128,10 @@ async def list_tools() -> list[Tool]:
                 "在磁盘文件中搜索关键词，返回匹配行的行号和前后 N 行上下文。\n"
                 "支持从尾部向前搜索（reverse=true），特别适合查找文件末尾的对话索引！\n"
                 "可通过 offset_lines + max_lines 限定搜索范围（如只搜最后 200 行）。\n"
-                "行号 0-based：第 1 行 = 0，最后一行 = -1。\n"
+                "行号 1-based：第 1 行 = 1（与 GNU grep -n / rg -n 同口径，"
+                "直接把输出喂给 sed/awk/grep 比对无需换算）。\n"
+                "⚠️ 但 read/write 的 offset_lines / at_line 是 0-based 索引，"
+                "把这里报的行号喂给它们需要 -1。\n"
                 "\n"
                 "编码：自动检测文件编码（UTF-8 / UTF-16LE / GB18030）。\n"
                 "非 UTF-8 文件透明转码搜索，输出标称原编码。\n"
@@ -1159,7 +1231,7 @@ async def list_tools() -> list[Tool]:
                 "搜索语法 = rg 正则（成熟语法），支持复杂正则与多文件检索。\n"
                 "默认扫描 md/txt/json/jsonl/zip 五类文件；可用 pattern（glob）过滤。\n"
                 "编码：自动检测，统一转换为 UTF-8 NFC + LF 后搜索（GBK/CRLF/NFD 文件同样可命中）。\n"
-                "行号 0-based：第 1 行 = 0。\n"
+                "行号 1-based：第 1 行 = 1（与 GNU grep -n 同口径）。\n"
                 "使用场景：找旧文件、恢复上下文、'哪些文件提到 XX'。\n"
                 "\n"
                 "ZIP：目录里的 DSH 导出归档会被自动钻取——先按中央目录分类（零解压），\n"
@@ -1581,7 +1653,7 @@ async def list_tools() -> list[Tool]:
             description=(
                 "⚠️ 此工具操作你的 WSL/Windows 本地文件系统，不要与 AI 客户端内置功能混淆！\n"
                 "\n"
-                "扫描对话文件中的对话索引块（支持 md/txt/json/jsonl/zip）。\n自动按格式分流：普通文本/单文档 JSON 扫对话索引；dsh JSONL 扫 U+2591 索引区 + compaction 压缩记录。\n输出中 U+2591 已转义为 [U+2591]（防污染）。行号 0-based。\n"
+                "扫描对话文件中的对话索引块（支持 md/txt/json/jsonl/zip）。\n自动按格式分流：普通文本/单文档 JSON 扫对话索引；dsh JSONL 扫 U+2591 索引区 + compaction 压缩记录。\n输出中 U+2591 已转义为 [U+2591]（防污染）。行号 1-based（对齐 grep 生态）。\n"
                 "\n"
                 "普通文本/单文档 JSON：\n"
                 "优先匹配新版格式 `# ░ 对话索引 ░`（含 U+2591 标记），无新版命中时回退旧版宽松格式。\n"
@@ -1595,7 +1667,9 @@ async def list_tools() -> list[Tool]:
                 "两区共享约 48K 的输出预算（计量单位随 DSH 版本，见输出闸门说明）：索引区优先保，\n"
                 "压缩记录用剩余预算；装不下时压缩记录降级为位置+摘要开头，可用 detail_lines 按行号提取全文。\n"
                 "\n"
-                "detail_lines：逗号分隔 0-based 行号，只洗这些 jsonl 行的文本输出（绕过索引/压缩扫描，\n"
+                "detail_lines：逗号分隔 1-based 行号（可直接填输出里看到的行号），只洗这些 jsonl 行的文本输出（绕过索引/压缩扫描，\n"
+                "仅对 dsh-jsonl 与 ZIP 生效：dsh 会话日志原生为 .jsonl.zstd（zstd 压缩），浏览器下载得到的是 ZIP 打包版，两者都支持；\n"
+                "裸 .jsonl 亦支持。传给普通文本/单文档 JSON 会**显式提示已忽略**（不静默吞参）。\n"
                 "供降级后二次提取完整摘要），如 detail_lines=\"3766,4621\"。\n"
                 "\n"
                 "ZIP（DSH Session Log 导出归档，session[.vN].jsonl + media/…，无 manifest）：\n"
@@ -1626,7 +1700,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "detail_lines": {
                         "type": "string",
-                        "description": "可选。逗号分隔的 0-based 行号（如 \"3766,4621\"），仅对 dsh JSONL 生效：只洗这些行提取文本全文返回，绕过索引/压缩扫描。",
+                        "description": "可选。逗号分隔的 1-based 行号（如 \"3766,4621\"，与 scan 输出同口径，可直接复制）。仅对 dsh-jsonl 与 ZIP 生效：dsh 会话日志原生为 .jsonl.zstd（zstd 压缩），浏览器界面下载得到的是 ZIP 打包版，两者都支持；裸 .jsonl 亦支持。传给普通文本/单文档 JSON 时会显式提示已忽略该参数。",
                     },
                     "debug": {
                         "type": "string",
@@ -1949,7 +2023,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 new_raw_lines[i] = tombstone * (repeat // ts_len)
 
             # Reassemble（raw 路径天然保留行首 BOM）
+            # v4.8：_read_raw_lines 已剥掉尾换行切出的空尾元素，故此处**显式补回**
+            # 文件结尾换行——否则首次墓碑化就会静默吞掉文件末尾的换行符。
+            with open(path, "rb") as fh:
+                _had_trailing_nl = fh.read().endswith(nl_bytes)
             new_raw = nl_bytes.join(new_raw_lines)
+            if _had_trailing_nl:
+                new_raw += nl_bytes
             with open(path, "wb") as fh:
                 fh.write(new_raw)
 
@@ -2144,7 +2224,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         with open(path, "rb") as fh:
             raw = fh.read()
 
-        raw_lines = raw.split(nl_bytes)
+        raw_lines = _split_lines_exact(raw, nl_bytes)
         total = len(raw_lines)
         kept: list[bytes] = []
         removed = 0
@@ -2162,7 +2242,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )]
 
         # Reassemble and write
+        # v4.8：同上，空尾元素已剥掉，尾换行需显式补回，否则 GC 会吞掉文件末尾换行。
         new_raw = nl_bytes.join(kept)
+        if raw.endswith(nl_bytes):
+            new_raw += nl_bytes
         with open(path, "wb") as fh:
             fh.write(new_raw)
 
@@ -2398,15 +2481,121 @@ def _normalize_lines_nfc_lf(lines: list[str]) -> str:
     return "\n".join(out) + ("\n" if out else "")
 
 
+# ── rg 缺失时的降级通道（v4.8）──────────────────────────────
+# 口径：rg 不可用**不是致命错误**，但**必须是显式的**——结果里带警告横幅、
+# stderr 同步打印一次。禁止静默降级：用户必须能分辨"真的没找到"与
+# "换了一套引擎、语义可能有差异"。
+_RG_INSTALL_HINT = "pacman -S ripgrep（Arch）或 apt install ripgrep（Debian/Ubuntu）"
+_python_fallback_warned = False
+
+
+def _rg_fallback_warning(reason: str) -> str:
+    """rg 不可用时统一构造警告横幅（结果内 + stderr 各一份，同一文案）。"""
+    return (
+        f"⚠️ 未检测到 ripgrep（rg）——{reason}。\n"
+        f"   已回退到 Python re 引擎：基本正则等价；但 lookaround / 反向引用 /\n"
+        f"   \\p{{...}} 等语法与 rg --pcre2 不同路，转义写法（如 \\b）也可能有差异。\n"
+        f"   建议安装 ripgrep 以恢复完整语义：{_RG_INSTALL_HINT}"
+    )
+
+
+def _warn_rg_fallback(reason: str) -> str:
+    """把降级警告落到 stderr（只首次打一次，避免刷屏），并返回横幅供结果内使用。
+
+    stderr 专用：MCP 的 JSON-RPC 走 stdout，写 stderr 不会污染协议。
+    """
+    global _python_fallback_warned
+    banner = _rg_fallback_warning(reason)
+    if not _python_fallback_warned:
+        _python_fallback_warned = True
+        try:
+            sys.stderr.write("\n" + banner + "\n\n")
+            sys.stderr.flush()
+        except Exception:
+            pass          # stderr 不可写（已重定向/关闭）不应影响工具主功能
+    return banner
+
+
+def _python_regex_search(text: str, query: str, *, case_sensitive: bool = False,
+                         fixed_string: bool = False) -> list[tuple[int, int, str]]:
+    """rg 缺席时的回退实现：逐行 Python re，返回与 _rg_search_text 同构的结果。
+
+    语义对齐的：
+      · 行号 0-based（与全局内部口径一致；对外显示由调用方 +1 转 1-based）
+      · 列 = **0-based 字符**偏移（匹配起点），与 rg 路径的 _byte_col_to_char_col 同义
+      · 每行只取**首个**匹配（rg --column 的默认行为，见 --only-matching 未启用）
+      · 不跨行匹配（逐行独立 re.search，与 rg 默认一致）
+    语义**不同**的（横幅里已声明，不假装等价）：
+      · 大小写不敏感时用 re.IGNORECASE（Unicode 感知，与 rg -i 基本一致）
+      · 非法正则：rg 会报"regex parse error"，本回退报 Python re 的 error——两者都抛
+        RuntimeError，绝不静默返回空结果
+    """
+    pattern = re.escape(query) if fixed_string else query
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        rx = re.compile(pattern, flags)
+    except re.error as exc:
+        raise RuntimeError(f"回退引擎（Python re）无法编译该正则：{exc}；原始 query={query!r}")
+
+    hits: list[tuple[int, int, str]] = []
+    for i, line in enumerate(text.split("\n")):
+        m = rx.search(line)
+        if m is None:
+            continue
+        hits.append((i, m.start(), line))
+    return hits
+
+
+def _run_rg_raw(args: list[str], *, stdin_text: bytes | None = None,
+                timeout: int = 30) -> tuple[list[str] | None, str, str]:
+    """执行 rg，返回 (stdout 原始行, 错误文本, 失败类别)。
+
+    只负责「跑 + 分类失败」，**不解析输出**——stdin 模式（`行:列:正文`）与
+    目录模式（`路径:行:正文`）形状不同，由各自调用方解析，不搞"万能解析器"。
+
+    失败类别（决定上层是降级还是报错）：
+      · "missing"        —— rg 不在 PATH → **降级**到 Python re
+      · "timeout"        —— 超时       → **降级**到 Python re（不能只留一句"超时"）
+      · "invalid-regex"  —— 用户正则非法；回退引擎同样会炸，故**原样升级报错**
+      · "rg-error"       —— 其它 rg 故障 → **原样升级报错**
+
+    成功与「零命中」（rg exit 1）都返回 (hits, "", "")；此处不生成警告，
+    由调用方决定口径——避免"没装 rg 但根本没搜索需求"也刷警告。
+    """
+    try:
+        proc = subprocess.run(args, input=stdin_text,
+                              capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        return None, "", "missing"
+    except subprocess.TimeoutExpired:
+        return None, "", "timeout"
+
+    if proc.returncode == 1:
+        return [], "", ""
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        low = err.lower()
+        kind = "invalid-regex" if ("regex parse error" in low
+                                   or "error parsing glob" in low
+                                   or "unrecognized escape" in low) else "rg-error"
+        return None, err, kind
+
+    return proc.stdout.decode("utf-8", errors="replace").splitlines(), "", ""
+
+
 def _rg_search_text(text: str, query: str, *, case_sensitive: bool = False,
                     fixed_string: bool = False, enable_pcre2: bool = False,
-                    timeout: int = 30) -> list[tuple[int, int, str]]:
-    """对归一化文本跑 rg（stdin 管道）。返回 [(0-based 行号, 0-based 字符列, 匹配行文本), ...]。
+                    timeout: int = 30) -> tuple[list[tuple[int, int, str]], str]:
+    """对归一化文本跑 rg（stdin 管道）。返回 (命中, 警告横幅)。
 
+    命中为 [(0-based 行号, 0-based 字符列, 匹配行文本), ...]。
     仅输出匹配行（上下文由调用方从原文件组装），rg 行号 1-based → 0-based。
     列用于把截断窗口居中到命中处；rg --column 给的是 1-based **字节** 偏移
     （实测 `中文字XYZMATCH` 报 13 而非 7），此处换算为字符偏移——
     Python 的 str 按字符索引，不换算就会在中文行上切错位。
+
+    v4.8：rg 缺失 / 超时 → 降级 Python re 并返回警告横幅（调用方负责渲染）；
+    正则非法 / 其它 rg 故障 → 抛 RuntimeError（回退救不了，静默兜底更糟）。
     """
     args = ["rg", "-n", "--column", "--no-heading", "--color", "never"]
     if not case_sensitive:
@@ -2417,36 +2606,42 @@ def _rg_search_text(text: str, query: str, *, case_sensitive: bool = False,
         args.append("--pcre2")
     args += ["--", query, "-"]
 
-    try:
-        proc = subprocess.run(args, input=text.encode("utf-8"),
-                              capture_output=True, timeout=timeout)
-    except FileNotFoundError:
-        raise RuntimeError("rg 未安装：请执行 `pacman -S ripgrep` 或 `apt install ripgrep`")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"rg 搜索超时（>{timeout}s）")
+    rows, err, kind = _run_rg_raw(args, stdin_text=text.encode("utf-8"),
+                                  timeout=timeout)
 
-    if proc.returncode == 1:
-        return []
-    if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"rg 搜索失败 (exit {proc.returncode}): {err[:300]}")
+    if rows is not None:
+        hits: list[tuple[int, int, str]] = []
+        for raw in rows:
+            c1 = raw.find(":")
+            if c1 <= 0:
+                continue
+            c2 = raw.find(":", c1 + 1)  # stdin 下形状为 `行:列:正文`（无文件名）
+            if c2 <= 0:
+                continue
+            try:
+                lineno = int(raw[:c1]) - 1        # rg 1-based → 0-based
+                byte_col = int(raw[c1 + 1:c2])
+            except ValueError:
+                continue
+            line_text = raw[c2 + 1:]
+            hits.append((lineno, _byte_col_to_char_col(line_text, byte_col), line_text))
+        return hits, ""
 
-    results: list[tuple[int, int, str]] = []
-    for raw in proc.stdout.decode("utf-8", errors="replace").splitlines():
-        c1 = raw.find(":")
-        if c1 <= 0:
-            continue
-        c2 = raw.find(":", c1 + 1)      # stdin 下形状为 `行:列:正文`（无文件名）
-        if c2 <= 0:
-            continue
-        try:
-            lineno = int(raw[:c1]) - 1            # rg 1-based → 0-based
-            byte_col = int(raw[c1 + 1:c2])
-        except ValueError:
-            continue
-        line_text = raw[c2 + 1:]
-        results.append((lineno, _byte_col_to_char_col(line_text, byte_col), line_text))
-    return results
+    if kind == "missing":
+        banner = _warn_rg_fallback("rg 不在 PATH 中")
+        return _python_regex_search(text, query, case_sensitive=case_sensitive,
+                                    fixed_string=fixed_string), banner
+    if kind == "timeout":
+        banner = _warn_rg_fallback(f"rg 搜索超时（>{timeout}s）")
+        return _python_regex_search(text, query, case_sensitive=case_sensitive,
+                                    fixed_string=fixed_string), banner
+
+    if kind == "invalid-regex":
+        raise RuntimeError(f"正则表达式非法（rg 拒绝）: {err[:300]}\n"
+                           f"  原始 query: {query!r}\n"
+                           f"  注：本机未装 rg 时改用 Python re，行为会一并报错，不会静默返回空结果。")
+    raise RuntimeError(f"rg 搜索失败 (exit≠0): {err[:300]}")
+
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2672,7 +2867,9 @@ def _render_hit_blocks(lines: list[str], hits: list[tuple[int, int, str]], *,
         for j in range(ctx_start, ctx_end):
             marker = ">>>" if j == ln else "   "
             text_j = lines[j].rstrip()
-            body.append(f"{marker} {j:6d}: "
+            # 上下文行标签同样按 1-based 显示——否则同一次输出里会出现
+            # 「匹配 N (行 1)」配「>>>  0: ...」两种口径（内部 j 仍是 0-based 索引）
+            body.append(f"{marker} {j + 1:6d}: "
                         f"{_truncate_ctx_line(text_j, col if j == ln else None)}")
         body.append("")
         blocks.append((ln, body))
@@ -2683,7 +2880,9 @@ def _grep_file_v2(arguments: dict, prefix: str = "") -> list[TextContent]:
     """cronopio_grep v2：rg 正则管线。
 
     保留旧 API（offset_lines/max_lines/reverse/before/after/max_results），
-    搜索内核换成 rg（成熟正则语法）。行号 0-based。
+    搜索内核换成 rg（成熟正则语法）。**对外行号 1-based**（对齐 GNU grep -n）；
+    内部 hits 仍是 0-based 索引，仅在渲染时 +1——「匹配 N (行 X)」的 X
+    与上下文行标签（`>>>  N: 正文`）**都**是 1-based。
     ZIP 容器（DSH Session Log 导出归档）：解压指定成员后复用本函数（member 缺省=根日志）。
 
     prefix：容器前缀行（如 ZIP 成员标注）。**计入输出预算**——否则"预算内的正文 +
@@ -2718,22 +2917,29 @@ def _grep_file_v2(arguments: dict, prefix: str = "") -> list[TextContent]:
     slice_lines = lines[start:end]
 
     text = _normalize_lines_nfc_lf(slice_lines)
-    hits = _rg_search_text(text, query, case_sensitive=case_sensitive,
-                           fixed_string=fixed_string, enable_pcre2=enable_pcre2)
+    hits, rg_warn = _rg_search_text(text, query, case_sensitive=case_sensitive,
+                                    fixed_string=fixed_string, enable_pcre2=enable_pcre2)
     hits = [(start + ln, col, txt) for ln, col, txt in hits]   # 切片偏移补偿
 
     enc_note = "" if is_utf8 else f" [原编码: {enc}]"
-    range_note = f" [搜 {start}-{end} 行 / 共 {total} 行]"
+    # 范围提示按 1-based 显示：切片边界 0-based 会渲染成「搜 0-100 行」，
+    # 看着像存在第 0 行；end 是开区间，恰好等于 1-based 的末行号。
+    range_note = f" [搜 {start + 1}-{end} 行 / 共 {total} 行]"
     direction_note = "（从尾部向前）" if reverse else ""
+    # 降级横幅置顶：必须出现在"未找到"之前，否则用户会把"引擎降级"误读成"确实没有"
+    prelude: list[str] = ([rg_warn] if rg_warn else [])
 
     if not hits:
         miss = f"在 {path} 中未找到 '{query}'{direction_note}{range_note}{enc_note}"
-        return [TextContent(type="text", text=f"{prefix}\n{miss}" if prefix else miss)]
+        body = f"{prefix}\n{miss}" if prefix else miss
+        return [TextContent(type="text",
+                            text="\n".join(prelude + [body]) if prelude else body)]
 
     # PyICU 缺失时显式自曝（不静默按码点切）
     gw = _grapheme_warning()
     hint = f"在 {path} 中找到 {len(hits)} 处匹配{direction_note}{range_note}{enc_note}:"
-    head: list[str] = ([prefix] if prefix else []) + ([gw] if gw else []) + [hint, ""]
+    head: list[str] = (prelude + ([prefix] if prefix else [])
+                       + ([gw] if gw else []) + [hint, ""])
     budget = _GREP_OUTPUT_BUDGET
     out: list[str] = list(head)
     used = sum(_out_cost(s) for s in head)
@@ -2751,7 +2957,8 @@ def _grep_file_v2(arguments: dict, prefix: str = "") -> list[TextContent]:
     folded: list[int] = []
     emitted = 0
     for ln, body in _render_hit_blocks(lines, shown, before=before, after=after):
-        block = [f"─── 匹配 {emitted + 1} (行 {ln}) ───"] + body
+        # 显示 1-based：与 GNU grep -n / rg -n 同口径（内部 ln 仍 0-based 索引）
+        block = [f"─── 匹配 {emitted + 1} (行 {ln + 1}) ───"] + body
         cost = sum(_out_cost(s) for s in block)
         if used + cost <= budget - tail_reserve:
             out.extend(block)
@@ -2761,7 +2968,8 @@ def _grep_file_v2(arguments: dict, prefix: str = "") -> list[TextContent]:
             folded.append(ln)
 
     if folded:
-        nums = ", ".join(str(n) for n in folded[:40])
+        # 折叠清单与匹配块同为对外输出 → 同样转 1-based，否则同一份输出里两种口径
+        nums = ", ".join(str(n + 1) for n in folded[:40])
         more = "" if len(folded) <= 40 else f" …等，共 {len(folded)} 处"
         out.append(f"（{len(folded)} 处超出返回预算 {budget}B，折叠为行号：{nums}{more}。"
                    f"请减小 max_results / before_context / after_context 分批取）")
@@ -2775,7 +2983,7 @@ def _grep_files_v2(arguments: dict) -> list[TextContent]:
     """cronopio_grepdir：目录内容搜索（rg 管线）。
 
     统一转换为 UTF-8 NFC + LF 后写入临时目录，rg 搜索临时目录，
-    行号 0-based（与全局口径一致），输出映射回原文件名。
+    行号 1-based（对齐 GNU grep -n）；内部 0-based 索引，仅显示时 +1。输出映射回原文件名。
     ZIP（DSH Session Log 导出归档）：中央目录分类（零解压）→ 只解压会话日志成员
     进同一个临时目录 → 复用同一次 rg 调用；输出标注「zip名::成员名」。
     """
@@ -2849,6 +3057,36 @@ def _grep_files_v2(arguments: dict) -> list[TextContent]:
                 fh.write(text)
             mapping[tmp_name] = fp
 
+        per_file: dict[str, list[tuple[int, str]]] = {}
+        rg_warn = ""
+
+        def _scan_with_python() -> dict:
+            """rg 缺席时的目录回退：逐临时文件跑 Python re，产出与 rg 分支同构的 per_file。
+
+            语义差异（由警告横幅显式声明）：Python re 无多行并行、无 rg 的
+            智能特化，大目录会明显更慢。命中形状（每文件 [(0-based 行, 正文)]）与
+            rg 分支一致——取行首匹配起点的 0-based 字符列，与 rg 的
+            _byte_col_to_char_col 同义（目录模式不消费列，仅保持同构）。
+            非法正则抛 RuntimeError（与 rg 分支同口径，绝不静默返回空结果）。
+            """
+            pattern = re.escape(query) if fixed_string else query
+            flags = 0 if case_sensitive else re.IGNORECASE
+            try:
+                rx = re.compile(pattern, flags)
+            except re.error as exc:
+                raise RuntimeError(f"回退引擎（Python re）无法编译该正则：{exc}；原始 query={query!r}")
+            acc: dict[str, list[tuple[int, str]]] = {}
+            for tmp_name, orig in mapping.items():
+                try:
+                    with open(os.path.join(tmp, tmp_name), encoding="utf-8") as fh:
+                        content = fh.read()
+                except OSError:
+                    continue
+                for i, line in enumerate(content.split("\n")):
+                    if rx.search(line):
+                        acc.setdefault(orig, []).append((i, line))
+            return acc
+
         args = ["rg", "-n", "--no-heading", "--color", "never"]
         if not case_sensitive:
             args.append("-i")
@@ -2858,37 +3096,40 @@ def _grep_files_v2(arguments: dict) -> list[TextContent]:
             args.append("--pcre2")
         args += ["--", query, tmp]
 
-        try:
-            proc = subprocess.run(args, capture_output=True, timeout=60)
-        except FileNotFoundError:
-            raise RuntimeError("rg 未安装：请执行 `pacman -S ripgrep` 或 `apt install ripgrep`")
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("rg 目录搜索超时（>60s）")
+        rows, rg_err, rg_kind = _run_rg_raw(args, timeout=60)
 
-        if proc.returncode == 1:
-            return [TextContent(type="text", text=(
-                f"在 {search_dir} 中未找到 '{query}'（{len(files)} 个文件"
-                + (f"，跳过 {skipped} 个读取失败" if skipped else "") + "）"))]
-        if proc.returncode != 0:
-            err = proc.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"rg 目录搜索失败 (exit {proc.returncode}): {err[:300]}")
-
-        per_file: dict[str, list[tuple[int, str]]] = {}
-        for raw in proc.stdout.decode("utf-8", errors="replace").splitlines():
-            c1 = raw.find(":")
-            c2 = raw.find(":", c1 + 1)
-            if c1 <= 0 or c2 <= 0:
-                continue
-            tmp_name = raw[:c1].rsplit('/', 1)[-1]   # rg 输出完整临时路径，取 basename 匹配 mapping
-            try:
-                ln = int(raw[c1 + 1:c2]) - 1          # rg 1-based → 0-based
-            except ValueError:
-                continue
-            orig = mapping.get(tmp_name, tmp_name)
-            per_file.setdefault(orig, []).append((ln, raw[c2 + 1:]))
+        if rows is None:
+            if rg_kind == "invalid-regex":
+                raise RuntimeError(
+                    f"正则表达式非法（rg 拒绝）: {rg_err[:300]}\n"
+                    f"  原始 query: {query!r}\n"
+                    f"  注：本机未装 rg 时改用 Python re，行为会一并报错，不会静默返回空结果。")
+            if rg_kind in ("missing", "timeout"):
+                reason = ("rg 不在 PATH 中" if rg_kind == "missing"
+                          else "rg 目录搜索超时（>60s）")
+                rg_warn = _warn_rg_fallback(reason + "；目录模式为逐文件顺序扫描，明显慢于 rg 并行")
+                per_file = _scan_with_python()
+            else:
+                raise RuntimeError(f"rg 目录搜索失败 (exit≠0): {rg_err[:300]}")
+        else:
+            for raw in rows:
+                c1 = raw.find(":")
+                c2 = raw.find(":", c1 + 1)
+                if c1 <= 0 or c2 <= 0:
+                    continue
+                # rg 输出完整临时路径，取 basename 匹配 mapping
+                tmp_name = raw[:c1].rsplit('/', 1)[-1]
+                try:
+                    ln = int(raw[c1 + 1:c2]) - 1      # rg 1-based → 0-based
+                except ValueError:
+                    continue
+                orig = mapping.get(tmp_name, tmp_name)
+                per_file.setdefault(orig, []).append((ln, raw[c2 + 1:]))
 
     ordered = sorted(per_file.items(), key=lambda kv: -len(kv[1]))
     head = [
+        # 降级横幅置顶：与单文件口径一致，不能让"引擎降级"藏在命中数后面
+        *([rg_warn] if rg_warn else []),
         f"在 {search_dir} 中搜索 '{query}'（{len(files)} 个文件"
         + (f"，跳过 {skipped} 个读取失败" if skipped else "") + "）：",
         f"命中 {len(ordered)} 个文件：",
@@ -2903,9 +3144,10 @@ def _grep_files_v2(arguments: dict) -> list[TextContent]:
         base = os.path.basename(fp)
         shown = hits[:max_per_file] if max_per_file > 0 else hits
         first = shown[0]
-        block = [f"{rank}. {base} —— {len(hits)} 处（首命中 行 {first[0]}: {first[1][:60]}）"]
+        block = [f"{rank}. {base} —— {len(hits)} 处"
+                 f"（首命中 行 {first[0] + 1}: {first[1][:60]}）"]
         for ln, txt in shown[1:]:
-            block.append(f"      行 {ln}: {txt[:60]}")
+            block.append(f"      行 {ln + 1}: {txt[:60]}")
         block.append("")
         cost = sum(_out_cost(s) for s in block)
         if used + cost > _GREP_OUTPUT_BUDGET - 400:
@@ -3780,7 +4022,7 @@ def _render_compaction_degraded(records: list[dict], head_chars: int = 300) -> l
 def _scan_indices_text(path: str, max_results: int, fmt: str) -> list[TextContent]:
     """普通文本 / 单文档 JSON：扫对话索引（新版 U+2591 优先，旧版回退）。
 
-    输出中 U+2591 转义为 [U+2591]（防污染）；行号 0-based。
+    输出中 U+2591 转义为 [U+2591]（防污染）；行号 1-based（对齐 grep 生态）。
     """
     file_size = os.path.getsize(path)
     if path.lower().endswith(".zstd"):
@@ -3832,7 +4074,7 @@ def _scan_indices_text(path: str, max_results: int, fmt: str) -> list[TextConten
     ]
 
     for idx, line_no in enumerate(matches):
-        out_lines.append(f"─── 匹配 {idx + 1} (行 {line_no}, 格式: {format_tag}) ───")
+        out_lines.append(f"─── 匹配 {idx + 1} (行 {line_no + 1}, 格式: {format_tag}) ───")
         metadata_lines: list[str] = []
         for j in range(line_no, min(total, line_no + 5)):
             stripped = lines[j].rstrip("\n\r")
@@ -3847,7 +4089,9 @@ def _scan_indices_text(path: str, max_results: int, fmt: str) -> list[TextConten
         for j in range(ctx_start, ctx_end):
             marker = ">>>" if j == line_no else "   "
             stripped = lines[j].rstrip("\n\r")
-            out_lines.append(f"{marker} {j:6d}: {_escape_zone(stripped)}")
+            # 上下文行标签 1-based：scan 输出整体是 1-based（见本函数匹配块），
+            # 这里漏掉就会同一次输出里两种口径
+            out_lines.append(f"{marker} {j + 1:6d}: {_escape_zone(stripped)}")
         out_lines.append("")
 
     if max_results > 0:
@@ -3863,29 +4107,87 @@ _JSONL_SCAN_BUDGET = _OUT_BUDGET
 
 # ── .zstd 透明读取：会话日志 session.vN.jsonl.zstd 是多帧拼接 ────────────
 
-def _read_maybe_zstd(path: str, max_bytes: int | None = None) -> bytes:
-    """读文件原始字节；`.zstd` 后缀先解压（多帧由 zstd CLI 处理）。
+def _zstd_read_python(path: str, max_bytes: int | None) -> bytes:
+    """zstandard 回退读（含多帧）。
 
-    只依赖 zstd 命令行（zstdcat / zstd -dc）——`zstandard` 模块不一定装。
-    max_bytes 用于只嗅探文件头：解压够用即杀掉子进程，不读整个人会话。
+    ⚠️ 多帧是这里最容易踩的坑：DSH 会话日志是**多帧拼接**的，
+    而 zstandard 的
+      · `ZstdDecompressor().decompress(raw)` —— 多帧直接 `ZstdError`
+        （实测报 "could not determine content size in frame header"）
+      · `decompressobj()` / `read_to_iter()` —— **只读第一帧就返回**
+        （实测 952KB 日志只给出 272 B，静默截断，比报错更危险）
+    只有 `stream_reader` 会跨帧读到底（实测与 `zstdcat` **逐字节相同**）。
+    故此处一律用 stream_reader，且**分块读**——`max_bytes` 只用于嗅探文件头时，
+    绝不能把整个会话解压物化到内存里。
     """
+    import zstandard                        # 延迟导入：未装时不影响非 zstd 路径
+    # ⚠️ 这里**不能**拿 os.path.getsize 当上限：那是对**压缩后**字节数的度量，
+    #    而本函数产出的是**解压后**字节。早先版本用 raw_size 当 want
+    #    （max_bytes=None 时），恰好在"解压输出 == 压缩大小"处截断——
+    #    真实日志上表现为 4,352,964 B 被砍成 952,956 B，且两个数字看起来都"合理"。
+    want = max_bytes if max_bytes is not None else None
+    out = bytearray()
+    try:
+        with open(path, "rb") as fh:
+            with zstandard.ZstdDecompressor().stream_reader(fh) as sr:
+                while want is None or len(out) < want:
+                    n = _ZSTD_PY_CHUNK if want is None else min(_ZSTD_PY_CHUNK, want - len(out))
+                    chunk = sr.read(n)
+                    if not chunk:
+                        break
+                    out += chunk
+    except zstandard.ZstdError as exc:
+        # max_bytes 的语义是"够用即停"，读到头部的 4096B 就停会切在帧中间——
+        # 那是**预期**的截断，不是损坏；已读到的部分照常返回。
+        # 但若一个字节都没读到，说明文件真的有病 → fail-loud，不静默返回空。
+        if not out:
+            raise RuntimeError(f"zstd 解压失败（{path}）：{exc}") from exc
+    return bytes(out)
+
+
+def _read_maybe_zstd(path: str, max_bytes: int | None = None) -> bytes:
+    """读文件原始字节；zstd 压缩则先解压（多帧安全）。
+
+    后端优先级：zstd/zstdcat CLI → zstandard 模块 → 都无则 fail-loud。
+    max_bytes 用于只嗅探文件头：**读够即停**——
+      · CLI 路径读够就杀掉子进程
+      · 回退路径分块读够就停（见 _zstd_read_python）
+
+    非 zstd 文件（无 `.zstd` 后缀 **且** 无 zstd 魔数）直接原样读。
+    """
+    # ── 判定是否 zstd：后缀优先，无后缀则嗅探魔数（后缀可能撒谎/缺失）──
     if not path.lower().endswith(".zstd"):
         with open(path, "rb") as fh:
-            return fh.read() if max_bytes is None else fh.read(max_bytes)
+            if not fh.read(4).startswith(_ZSTD_MAGIC):
+                fh.seek(0)
+                return fh.read() if max_bytes is None else fh.read(max_bytes)
+        # 魔数命中 → 落下去按 zstd 解
+
     exe = shutil.which("zstdcat") or shutil.which("zstd")
-    if exe is None:
-        raise RuntimeError("读取 .zstd 需要 zstd / zstdcat 可执行文件")
-    args = [exe, path] if os.path.basename(exe).startswith("zstdcat") else [exe, "-dc", path]
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    try:
-        data = proc.stdout.read() if max_bytes is None else proc.stdout.read(max_bytes)
-    finally:
-        proc.kill()
+    if exe is not None:
+        args = ([exe, path] if os.path.basename(exe).startswith("zstdcat")
+                else [exe, "-dc", path])
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
-            proc.communicate(timeout=5)
-        except Exception:
-            pass
-    return data
+            data = proc.stdout.read() if max_bytes is None else proc.stdout.read(max_bytes)
+        finally:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+        return data
+
+    try:
+        return _zstd_read_python(path, max_bytes)
+    except ImportError as exc:
+        raise RuntimeError(
+            "读取 zstd 需要下列任一项：\n"
+            "  · zstd / zstdcat 可执行文件（推荐；pacman -S zstd）\n"
+            "  · Python `zstandard` 模块（pip install zstandard，本机 3.12 venv 已装）\n"
+            "  · Python 3.14+ 的标准库 compression.zstd\n"
+            f"（原始错误：{exc}）") from exc
+
 
 
 def _read_jsonl_lines(path: str) -> tuple[list[str], int, int]:
@@ -3953,12 +4255,12 @@ def _render_dsh_index_section(lines: list[str], total: int, max_results: int,
         stripped = lines[line_no].rstrip("\n\r")
         washed = _wash_jsonl_line(stripped, line_no)
         if washed is None:
-            entry = [f"行 {line_no}: (jsonl 记录无可提取文本，跳过)", ""]
+            entry = [f"行 {line_no + 1}: (jsonl 记录无可提取文本，跳过)", ""]
         else:
             rec_type, text = washed
             raw_bytes = len(stripped.encode("utf-8"))
             text_bytes = len(text.encode("utf-8"))
-            entry = [f"行 {line_no} [{rec_type}] (原始 {raw_bytes}B → 洗后 {text_bytes}B):"]
+            entry = [f"行 {line_no + 1} [{rec_type}] (原始 {raw_bytes}B → 洗后 {text_bytes}B):"]
             entry.extend(text.split("\n"))
             entry.append("")
         prepared.append((line_no, entry))
@@ -3975,7 +4277,9 @@ def _render_dsh_index_section(lines: list[str], total: int, max_results: int,
         else:
             folded.append(line_no)
     if folded:
-        fold_note = ", ".join(str(n) for n in folded)
+        # fold_note 会被 LLM **原样填回 detail_lines**（1-based 输入）——
+        # 必须同口径 +1，否则复制粘贴正好错一行
+        fold_note = ", ".join(str(n + 1) for n in folded)
         emit(f"（{len(folded)} 条超出剩余预算，折叠为行号。需要完整内容请用 "
              f"detail_lines=\"{fold_note}\" 提取）")
         emit("")
@@ -3992,8 +4296,8 @@ def _scan_dsh_jsonl(path: str, max_results: int, detail_lines: str | None = None
     压缩记录（type 白名单，无污染风险）。共享输出预算：索引区先占，
     压缩记录用剩余；装不下压缩记录则降级为位置+开头并提醒 detail_lines。
 
-    detail_lines: 逗号分隔 0-based 行号 → 只洗这些行提取文本（绕过索引/压缩
-    扫描，供降级后二次提取）。行号 0-based，输出中 U+2591 转义。
+    detail_lines: 逗号分隔 **1-based** 行号（与输出行号同口径，可原样复制）→
+    只洗这些行提取文本（绕过索引/压缩扫描，供降级后二次提取）。
     """
     if path.lower().endswith(".zstd"):
         # 会话日志：zstd 多帧拼接，直接解压读（无墓碑语义）
@@ -4048,10 +4352,12 @@ def _scan_dsh_jsonl(path: str, max_results: int, detail_lines: str | None = None
             except ValueError:
                 emit(f"detail_lines 含非行号: {part!r}")
                 continue
-            if ln < 0 or ln >= total:
-                emit(f"detail_lines 行号越界 (0..{total - 1}): {ln}")
+            # detail_lines 是 1-based 输入（与 scan 输出行号同口径）——
+            # LLM 可把输出里看到的行号原样填回，无需 -1 换算
+            if ln < 1 or ln > total:
+                emit(f"detail_lines 行号越界 (1..{total}): {ln}")
                 continue
-            wanted.append(ln)
+            wanted.append(ln - 1)
         if wanted:
             emit(f"─── detail_lines 提取 ({len(wanted)} 行) ───")
             # 预洗所有点名行，按整条核算预算
@@ -4060,12 +4366,12 @@ def _scan_dsh_jsonl(path: str, max_results: int, detail_lines: str | None = None
                 stripped = lines[line_no].rstrip("\n\r")
                 washed = _wash_jsonl_line(stripped, line_no)
                 if washed is None:
-                    entry = [f"行 {line_no}: (jsonl 记录解析失败或无 text 块)", ""]
+                    entry = [f"行 {line_no + 1}: (jsonl 记录解析失败或无 text 块)", ""]
                 else:
                     rec_type, text = washed
                     raw_bytes = len(stripped.encode("utf-8"))
                     text_bytes = len(text.encode("utf-8"))
-                    entry = [f"行 {line_no} [{rec_type}] (原始 {raw_bytes}B → 洗后 {text_bytes}B):"]
+                    entry = [f"行 {line_no + 1} [{rec_type}] (原始 {raw_bytes}B → 洗后 {text_bytes}B):"]
                     entry.extend(text.split("\n"))
                     entry.append("")
                 prepared_dl.append((line_no, entry))
@@ -4079,7 +4385,8 @@ def _scan_dsh_jsonl(path: str, max_results: int, detail_lines: str | None = None
                     folded_dl.append(line_no)
             if folded_dl:
                 emit(f"（{len(folded_dl)} 行超出返回预算 {budget}B，未展开。"
-                     f"请减小 detail_lines 行数分批提取：\"{','.join(str(n) for n in folded_dl)}\"）")
+                     # 同样会被原样填回 detail_lines（1-based）→ 同口径 +1
+                     f"请减小 detail_lines 行数分批提取：\"{','.join(str(n + 1) for n in folded_dl)}\"）")
                 emit("")
         return [TextContent(type="text", text="\n".join(out))]
 
@@ -4113,7 +4420,7 @@ def _scan_v2(arguments: dict) -> list[TextContent]:
     · dsh JSONL → U+2591 索引区（assistant/message 候选）+ compaction 压缩记录，
       共享输出预算（计量单位随 DSH 版本：0.1.5 字节 / 0.1.7 UTF-16 码元）
     · ZIP（DSH Session Log 导出归档）→ 中央目录分类选中成员 → 解压后走 dsh JSONL 分支
-    输出中 U+2591 转义为 [U+2591]（防污染，不影响理解）。行号 0-based。
+    输出中 U+2591 转义为 [U+2591]（防污染，不影响理解）。行号 1-based（对齐 grep 生态）。
     """
     path = _normalize_path(arguments["path"])
     raw_mr = arguments.get("max_results")
@@ -4134,7 +4441,27 @@ def _scan_v2(arguments: dict) -> list[TextContent]:
     fmt = _detect_file_format(path)
     if fmt == "dsh-jsonl":
         return _scan_dsh_jsonl(path, max_results, detail_lines, debug)
-    return _scan_indices_text(path, max_results, fmt)
+
+    res = _scan_indices_text(path, max_results, fmt)
+
+    # detail_lines 只对 dsh-jsonl（含 .jsonl.zstd）与 ZIP 打包格式有意义。
+    # 传给了别的格式 → **显式告知**，不静默吞掉参数；否则调用者会以为
+    # "我提了、它没给"→ 误判成"这里没有内容"。
+    if detail_lines:
+        note = (
+            "⚠️ 本格式不支持 detail_lines，已忽略该参数。\n"
+            f"   本文件被判定为：{fmt}（普通文本 / 单文档 JSON）。\n"
+            "   detail_lines 只对下列两类输入有意义：\n"
+            "     · dsh-jsonl —— DSH 会话日志。原生保存是 **.jsonl.zstd**（zstd 压缩），\n"
+            "       浏览器界面下载得到的是 **ZIP 打包**版，两者都走 jsonl 分支、都支持；\n"
+            "       裸 .jsonl（未压缩）同样支持。\n"
+            "     · ZIP —— DSH Session Log 导出归档（session*.jsonl[.vN] + media/）。\n"
+            "   本模式已直接展示匹配行的前后上下文，无需再按行号二次提取。"
+        )
+        head_text = getattr(res[0], "text", "") if res else ""
+        res = [TextContent(type="text",
+                           text=(note + "\n\n" + head_text) if head_text else note)]
+    return res
 
 
 # ═══════════════════════════════════════════════════════════
