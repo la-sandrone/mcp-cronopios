@@ -6,8 +6,11 @@
 """
 文件名: worker.py
 摘要: mcp-calculator 的求值子进程。AST 白名单 + mpmath 任意精度数值求值。
+      输入是一个「名字 → 表达式」映射（exprs），按依赖拓扑序求值：
+      表达式可以引用同一映射里已定义的别的名字，互相引用成环则结构化报错。
       只允许数值计算与变量带入，不含任何求解类函数
       （findroot/odefun/solve 一律不在白名单——解方程走 mcp_eqsolve.py）。
+      以 python -I 隔离模式运行；--selftest 可离线自测。
       以 python -I 隔离模式运行；--selftest 可离线自测。
 依赖: mpmath
 """
@@ -16,6 +19,7 @@ import ast
 import json
 import resource
 import sys
+from graphlib import CycleError, TopologicalSorter
 
 import mpmath
 
@@ -32,6 +36,7 @@ MAX_ARG_VALUE = 10000      # factorial/binomial 等参数上限
 MAX_RESULT_CHARS = 20000   # 结果文本长度上限
 MAX_AST_DEPTH = 200        # AST 嵌套深度上限
 MAX_CALL_ARGS = 10         # 单次函数调用参数个数上限
+MAX_EXPRS = 100            # exprs 条目数上限（一次调用的命名表达式条数）
 MEM_LIMIT = 1 << 30        # RLIMIT_AS = 1 GiB
 
 # ═══════════════════════════════════════════════
@@ -161,6 +166,11 @@ for _wname, _wfn in _FUNCTION_WRAPPERS.items():
         FUNCTIONS[_wname] = _wfn
         if _wname in MISSING_FUNCTIONS:
             MISSING_FUNCTIONS.remove(_wname)
+# 保留名：白名单函数名与常量名不得用作 exprs 的键。
+# 理由：lookup_name 的解析顺序是 变量 → 函数 → 常量。若把键取名 'sin'，
+#       另一条表达式里的 sin(2) 会先命中那个变量而变成"不可调用"——
+#       同一个词在两条表达式里指两个东西。歧义必须在入口处拒绝。
+RESERVED_NAMES = frozenset(FUNCTIONS) | frozenset(CONSTANT_NAMES)
 
 
 # ═══════════════════════════════════════════════
@@ -290,8 +300,9 @@ class Evaluator:
             f"名字 '{name}' 未定义",
             line=node.lineno,
             col=node.col_offset + 1,
-            hint=('变量请通过 vars 参数绑定（如 {"x": "2"}）；'
-                  "函数仅限白名单，见工具描述。"),
+            hint=('名字须在本次调用的 exprs 映射里定义'
+                  '（如 {"x": "2", "r": "x + 1"}）；'
+                  '函数仅限白名单，见工具描述。'),
         )
 
     # ── 二元运算 ──
@@ -401,33 +412,103 @@ def parse_expr(text):
         raise CalcError("DepthError", "表达式嵌套过深，无法解析")
 
 
-def compute(expr, variables, dps):
-    """核心计算：设置工作精度 → 变量求值（纯常量表达式）→ 主表达式求值。"""
+def free_names(node):
+    """取表达式的自由变量名集合。
+
+    规则（精确，不是启发式）：AST 里所有 ast.Name 的 id，减去白名单函数名与常量名。
+    之所以减一下就干净——eval_call 强制 node.func 必须是 ast.Name 且在 FUNCTIONS 里，
+    所以"函数名"那些 Name 节点必然落在白名单内，减掉即排除。
+    剩下的就是自由变量：它们要么在本映射里被定义，要么由 lookup_name 报 NameError。
+    """
+    used = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    return used - RESERVED_NAMES
+
+
+def compute_map(exprs, dps):
+    """核心计算：解析全部条目 → 建依赖图 → 拓扑序求值。
+
+    求值顺序完全由依赖图决定，与 JSON 对象的键序无关
+    （JSON 规范里对象是无序映射，任何依赖键序的规则都不可靠）。
+    """
     # guard digits：内部计算精度 = 显示精度 + 10，
     # 二进制存储的尾噪声因此落在显示位数之外（nstr 截掉）。
     mpmath.mp.dps = dps + GUARD_DIGITS
 
-    if not expr.strip():
-        raise CalcError("SyntaxError", "表达式为空")
-    if len(expr) > MAX_EXPR_LEN:
+    if not exprs:
+        raise CalcError("EmptyExpression",
+                        "exprs 为空——至少要有一个「名字: 表达式」")
+    if len(exprs) > MAX_EXPRS:
         raise CalcError("LengthLimitError",
-                        f"表达式长度超过 {MAX_EXPR_LEN} 字符")
+                        f"exprs 条目数 {len(exprs)} 超过上限 {MAX_EXPRS}")
 
-    # 变量求值：变量值必须是"纯常量表达式"（不允许引用其他变量）
-    # ——防幻觉机制继承 mcp_eqsolve 的变量契约哲学：未绑定即拒绝。
-    var_values = {}
-    for name, expr_str in (variables or {}).items():
+    # ── 1. 逐条校验 + 解析（报错带上条目名，LLM 才知道是哪一条坏了）──
+    nodes = {}
+    texts = {}
+    for name, text in exprs.items():
         if not isinstance(name, str) or not name.isidentifier():
-            raise CalcError("VarError", f"非法变量名: {name!r}")
-        if not isinstance(expr_str, str):
-            raise CalcError("VarError",
-                            f"变量 '{name}' 的值必须是表达式字符串")
-        var_node = parse_expr(expr_str).body
-        var_values[name] = Evaluator({}, dps).evaluate(var_node)
+            raise CalcError(
+                "NameError",
+                f"非法名字 {name!r}——键必须是标识符（字母/下划线开头），"
+                "值才是表达式字符串",
+                hint='形状是 {"名字": "表达式"}，例如 {"tau_s": "C/P/3.15576e7"}。'
+                     "不要把表达式当键，也不要写成数组。",
+            )
+        if name in RESERVED_NAMES:
+            raise CalcError(
+                "NameError",
+                f"名字 {name!r} 是保留名（白名单函数或常量），不能用作键",
+                hint=f"换一个名字（如 {name} -> {name}_v）",
+            )
+        if not isinstance(text, str):
+            raise CalcError(
+                "TypeError",
+                f"[{name}] 的值必须是表达式字符串（JSON 里要带引号）",
+                hint='正确: {"r": "1+1"}    错误: {"r": 1+1}',
+            )
+        if not text.strip():
+            raise CalcError("EmptyExpression", f"[{name}] 表达式为空")
+        if len(text) > MAX_EXPR_LEN:
+            raise CalcError("LengthLimitError",
+                            f"[{name}] 表达式长度超过 {MAX_EXPR_LEN} 字符")
+        texts[name] = text
+        try:
+            nodes[name] = parse_expr(text).body
+        except CalcError as e:
+            raise CalcError(e.etype, f"[{name}] {e.message}",
+                            expr=text, line=e.line, col=e.col, hint=e.hint)
 
-    # 主表达式求值（解包顶层 ast.Expression）
-    main_node = parse_expr(expr).body
-    return Evaluator(var_values, dps).evaluate(main_node)
+    # ── 2. 依赖图：只保留指向本映射内部名字的边（外部名字留给 lookup_name 报错）──
+    graph = {
+        name: {dep for dep in free_names(node) if dep in nodes}
+        for name, node in nodes.items()
+    }
+
+    # ── 3. 拓扑序；有环则报出环的路径（LLM 自愈闭环）──
+    try:
+        order = list(TopologicalSorter(graph).static_order())
+    except CycleError as exc:
+        members = [str(n) for n in (exc.args[1] if len(exc.args) > 1 else [])]
+        path = " → ".join(members)
+        definitions = "; ".join(
+            f'{n} = "{texts.get(n, "")}"' for n in dict.fromkeys(members)
+        )
+        raise CalcError(
+            "CycleError",
+            f"表达式互相引用成环: {path}",
+            hint=f"环上的定义: {definitions}。至少断开其中一条"
+                 "（让环上的某个名字不再引用环上的其它名字）。",
+        )
+
+    # ── 4. 按拓扑序求值，边算边注入（就绪的节点保证前驱都已算完）──
+    values = {}
+    for name in order:
+        try:
+            values[name] = Evaluator(values, dps).evaluate(nodes[name])
+        except CalcError as e:
+            raise CalcError(e.etype, f"[{name}] {e.message}",
+                            expr=texts[name], line=e.line, col=e.col, hint=e.hint)
+
+    return values
 
 
 # ═══════════════════════════════════════════════
@@ -479,15 +560,26 @@ def format_number(x, dps):
     return str(x)
 
 
-def finalize_result(value, dps):
-    text = format_number(value, dps)
-    if len(text) > MAX_RESULT_CHARS:
-        raise CalcError(
-            "ResultLimitError",
-            f"结果文本超过 {MAX_RESULT_CHARS} 字符（计算成功但输出被拒）",
-            hint="可降低 dps 或拆分计算",
-        )
-    return text
+def finalize_map(values, dps):
+    """名字 → 已格式化文本，**按名字排序**。
+
+    排序不是审美：TopologicalSorter 只保证"某个合法拓扑序"，互不依赖的条目
+    其相对顺序取决于字符串哈希（PYTHONHASHSEED 随进程变化）⇒ 不跨进程稳定。
+    结果按名字排序后，同一份输入在任何进程里输出完全一致。
+    """
+    rows = []
+    total = 0
+    for name in sorted(values):
+        text = format_number(values[name], dps)
+        total += len(text) + len(name) + 4
+        if total > MAX_RESULT_CHARS:
+            raise CalcError(
+                "ResultLimitError",
+                f"结果文本超过 {MAX_RESULT_CHARS} 字符（计算成功但输出被拒）",
+                hint="可降低 dps 或拆分 exprs",
+            )
+        rows.append([name, text])
+    return rows
 
 
 # ═══════════════════════════════════════════════
@@ -526,20 +618,22 @@ def main():
 
     try:
         payload = json.loads(argv[0])
-        expr = payload.get("expr", "")
-        variables = payload.get("vars") or {}
+        exprs = payload.get("exprs") or {}
         dps = payload.get("dps") or DEFAULT_DPS
 
-        if not isinstance(variables, dict):
-            raise CalcError("VarError", "vars 必须是 JSON 对象")
+        if not isinstance(exprs, dict):
+            raise CalcError(
+                "TypeError",
+                "exprs 必须是 JSON 对象（名字 → 表达式字符串）",
+                hint='正确: {"tau_s": "C/P/3.15576e7"}    错误: ["C/P/3.15576e7"]',
+            )
         if (not isinstance(dps, int) or isinstance(dps, bool)
                 or not (1 <= dps <= MAX_DPS)):
             raise CalcError("DpsError",
                             f"dps 必须是 1-{MAX_DPS} 的整数")
 
-        value = compute(expr, variables, dps)
-        text = finalize_result(value, dps)
-        emit({"ok": True, "result": text})
+        values = compute_map(exprs, dps)
+        emit({"ok": True, "results": finalize_map(values, dps)})
     except CalcError as e:
         emit({"ok": False, "error": e.to_dict()})
     except MemoryError:
@@ -559,98 +653,130 @@ def main():
 #  自测（--selftest，离线验证核心路径）
 # ═══════════════════════════════════════════════
 
-def expect_eq(text):
-    return ("eq", text)
+def expect_eq(key, text):
+    return ("eq", key, text)
 
 
-def expect_approx(text, tol="1e-20"):
-    return ("approx", text, tol)
+def expect_approx(key, text, tol="1e-20"):
+    return ("approx", key, text, tol)
 
 
-def expect_contains(sub):
-    return ("contains", sub)
+def expect_contains(key, sub):
+    return ("contains", key, sub)
 
 
 def expect_error(etype):
     return ("error", etype)
 
 
+def expect_order(names):
+    return ("order", names)
+
+
+# 多数用例检查名为 "r" 的结果；依赖链用例把最终值落在 r 上。
 SELFTEST_CASES = [
-    # (名称, 表达式, vars, dps, 期望)
-    ("加法",            "1 + 2",                 None,   50, expect_eq("3")),
-    ("浮点精度",        "0.1 + 0.2",             None,   50, expect_eq("0.3")),
-    ("下划线数字",      "1_000_000 + 1",         None,   50, expect_eq("1000001")),
-    ("取模",            "7 % 3",                 None,   50, expect_eq("1")),
-    ("整除",            "7 // 3",                None,   50, expect_eq("2")),
-    ("三角函数",        "sin(pi/2)",             None,   50, expect_eq("1")),
-    ("gamma",           "gamma(10)",             None,   50, expect_eq("362880")),
-    ("Bessel J0(1)",    "besselj(0, 1)",         None,   50,
-     expect_approx("0.76519768655796655144971752610266322090927428975532")),
-    ("zeta(2)",         "zeta(2)",               None,   50,
-     expect_approx("1.6449340668482264364724151666460251892189499012068")),
+    # (名称, exprs, dps, 期望)
+    ("加法",            {"r": "1 + 2"},                      50, expect_eq("r", "3")),
+    ("浮点精度",        {"r": "0.1 + 0.2"},                  50, expect_eq("r", "0.3")),
+    ("下划线数字",      {"r": "1_000_000 + 1"},              50, expect_eq("r", "1000001")),
+    ("取模",            {"r": "7 % 3"},                      50, expect_eq("r", "1")),
+    ("整除",            {"r": "7 // 3"},                     50, expect_eq("r", "2")),
+    ("三角函数",        {"r": "sin(pi/2)"},                  50, expect_eq("r", "1")),
+    ("gamma",           {"r": "gamma(10)"},                  50, expect_eq("r", "362880")),
+    ("Bessel J0(1)",    {"r": "besselj(0, 1)"},              50,
+     expect_approx("r", "0.76519768655796655144971752610266322090927428975532")),
+    ("zeta(2)",         {"r": "zeta(2)"},                    50,
+     expect_approx("r", "1.6449340668482264364724151666460251892189499012068")),
     # quad 区间约定：mpmath 用 [a, b] 列表（quad(f, a, b) 会被当两个区间）
-    ("积分",            "quad(sin, [0, pi])",    None,   50, expect_approx("2")),
-    ("复数",            "sqrt(-1)",              None,   50, expect_contains("1j")),
-    ("矩阵行列式",      "det(matrix([[1,2],[3,4]]))", None, 50, expect_eq("-2")),
-    ("矩阵输出",        "matrix([[1,2],[3,4]])", None,   50, expect_contains("[1, 2]")),
-    # 变量带入用精确值（sqrt(2) 的平方有浮点误差，另由 approx 用例覆盖）
-    ("变量带入",        "x**2 + 1",              {"x": "2"}, 50, expect_eq("5")),
-    ("变量值含函数",    "y * 2",                 {"y": "gamma(5)"}, 50,
-     expect_eq("48")),
+    ("积分",            {"r": "quad(sin, [0, pi])"},         50, expect_approx("r", "2")),
+    ("复数",            {"r": "sqrt(-1)"},                   50, expect_contains("r", "1j")),
+    ("矩阵行列式",      {"r": "det(matrix([[1,2],[3,4]]))"}, 50, expect_eq("r", "-2")),
+    ("矩阵输出",        {"r": "matrix([[1,2],[3,4]])"},      50, expect_contains("r", "[1, 2]")),
+    # 名字带入用精确值（sqrt(2) 的平方有浮点误差，另由 approx 用例覆盖）
+    ("名字带入",        {"x": "2", "r": "x**2 + 1"},         50, expect_eq("r", "5")),
+    ("名字值含函数",    {"y": "gamma(5)", "r": "y * 2"},     50, expect_eq("r", "48")),
     # wrapper 兼容层（mpmath 1.3.0 缺失函数）
-    ("log2包装",        "log2(8)",               None,   50, expect_eq("3")),
-    ("trunc包装",       "trunc(-3.7)",           None,   50, expect_eq("-3")),
-    ("lgamma包装",      "lgamma(5)",             None,   50,
-     expect_approx("3.178053830347945619646941601297727408871")),
-    ("erfcinv包装",     "erfcinv(0.5)",          None,   50,
-     expect_approx("0.47693627620446987338141835364313055980896974905947")),
-    ("y0包装",          "y0(1)",                 None,   50,
-     expect_approx("0.088256964215676957982926766023514915890443728463031",
+    ("log2包装",        {"r": "log2(8)"},                    50, expect_eq("r", "3")),
+    ("trunc包装",       {"r": "trunc(-3.7)"},                50, expect_eq("r", "-3")),
+    ("lgamma包装",      {"r": "lgamma(5)"},                  50,
+     expect_approx("r", "3.178053830347945619646941601297727408871")),
+    ("erfcinv包装",     {"r": "erfcinv(0.5)"},               50,
+     expect_approx("r", "0.47693627620446987338141835364313055980896974905947")),
+    ("y0包装",          {"r": "y0(1)"},                      50,
+     expect_approx("r", "0.088256964215676957982926766023514915890443728463031",
                    "1e-10")),
     # 对角矩阵求逆精确（0.5 = 2^-1 可精确表示），避免 LU 分解尾噪声
-    ("inv包装",         "inv(matrix([[2,0],[0,3]]))", None, 50,
-     expect_contains("0.5")),
-    ("dot包装",         "dot(matrix([[1,2],[3,4]]), matrix([[0,1],[1,0]]))",
-     None, 50, expect_contains("4")),
-    ("transpose包装",   "transpose(matrix([[1,2],[3,4]]))", None, 50,
-     expect_contains("3")),
-    ("eigvals包装",     "eigvals(matrix([[1,2],[3,4]]))", None, 50,
-     expect_contains("5.3722813232690143")),
+    ("inv包装",         {"r": "inv(matrix([[2,0],[0,3]]))"}, 50, expect_contains("r", "0.5")),
+    ("dot包装",         {"r": "dot(matrix([[1,2],[3,4]]), matrix([[0,1],[1,0]]))"},
+     50, expect_contains("r", "4")),
+    ("transpose包装",   {"r": "transpose(matrix([[1,2],[3,4]]))"}, 50, expect_contains("r", "3")),
+    ("eigvals包装",     {"r": "eigvals(matrix([[1,2],[3,4]]))"},   50,
+     expect_contains("r", "5.3722813232690143")),
+    # ── 依赖图（DAG）行为 ──
+    ("依赖链",          {"a": "1+1", "b": "a*10", "r": "b+a"},
+     50, expect_eq("r", "22")),
+    ("依赖链引用常量",  {"C": "3.74e28", "P": "140e15", "r": "C/P/3.15576e7"},
+     50, expect_approx("r", "8465.2463160334481347486138725", "1e-25")),
+    ("反序书写仍正确",  {"r": "b+a", "b": "a*10", "a": "1+1"},
+     50, expect_eq("r", "22")),
+    ("输出按键名排序",  {"b": "2", "a": "1", "r": "a+b"},
+     50, expect_order(["a", "b", "r"])),
+    ("两条独立也排序",  {"z": "1", "a": "2"},
+     50, expect_order(["a", "z"])),
+    ("环",              {"a": "b+1", "b": "a+1"},            50, expect_error("CycleError")),
+    ("三节点环",        {"a": "b", "b": "c", "c": "a"},      50, expect_error("CycleError")),
+    ("自引用",          {"a": "a+1"},                        50, expect_error("CycleError")),
+    ("保留名作键",      {"sin": "1", "r": "2"},              50, expect_error("NameError")),
+    ("键不是标识符",    {"a+b": "1"},                        50, expect_error("NameError")),
+    ("空映射",          {},                                  50, expect_error("EmptyExpression")),
+    ("值为空串",        {"r": "   "},                        50, expect_error("EmptyExpression")),
+    ("依赖未定义名",    {"r": "x + 1"},                      50, expect_error("NameError")),
     # 红线与安全
-    ("幂指数超限",      "10**2000",              None,   50, expect_error("PowerLimitError")),
-    ("factorial超限",   "factorial(20000)",      None,   50, expect_error("ArgLimitError")),
-    ("未绑定名字",      "sqrt(1 + x)",           None,   50, expect_error("NameError")),
-    ("除零",            "1/0",                   None,   50, expect_error("ZeroDivisionError")),
-    ("不在白名单函数",  "besseljj(0, 1)",        None,   50, expect_error("NameError")),
-    ("禁止属性访问",    "mpmath.sin(1)",         None,   50, expect_error("UnsupportedSyntax")),
-    ("禁止import",      "import os",             None,   50, expect_error("SyntaxError")),
-    ("无求解函数",      "findroot(sin, 3)",      None,   50, expect_error("NameError")),
+    ("幂指数超限",      {"r": "10**2000"},                   50, expect_error("PowerLimitError")),
+    ("factorial超限",   {"r": "factorial(20000)"},           50, expect_error("ArgLimitError")),
+    ("未绑定名字",      {"r": "sqrt(1 + x)"},                50, expect_error("NameError")),
+    ("除零",            {"r": "1/0"},                        50, expect_error("ZeroDivisionError")),
+    ("不在白名单函数",  {"r": "besseljj(0, 1)"},             50, expect_error("NameError")),
+    ("禁止属性访问",    {"r": "mpmath.sin(1)"},              50, expect_error("UnsupportedSyntax")),
+    ("禁止import",      {"r": "import os"},                  50, expect_error("SyntaxError")),
+    ("无求解函数",      {"r": "findroot(sin, 3)"},           50, expect_error("NameError")),
 ]
 
 
-def check_case(expr, variables, dps, expect):
+def check_case(exprs, dps, expect):
     kind = expect[0]
     try:
-        value = compute(expr, variables, dps)
-        text = finalize_result(value, dps)
+        values = compute_map(exprs, dps)
+        rows = finalize_map(values, dps)
     except CalcError as e:
         if kind == "error":
-            return e.etype == expect[1], e.etype
+            return e.etype == expect[1], f"{e.etype}: {e.message}"
         return False, f"CalcError({e.etype}): {e.message}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
+    if kind == "error":
+        return False, f"期望 {expect[1]} 错误，实际成功"
+
+    if kind == "order":
+        got = [name for name, _ in rows]
+        return got == expect[1], f"实际顺序 {got}"
+
+    lookup = dict(rows)
+    key = expect[1]
+    if key not in lookup:
+        return False, f"结果缺少 {key!r}（实际有 {sorted(lookup)}）"
+    text = lookup[key]
+
     if kind == "eq":
-        return text == expect[1], text
+        return text == expect[2], text
     if kind == "approx":
         try:
-            return abs(float(text) - float(expect[1])) < float(expect[2]), text
+            return abs(float(text) - float(expect[2])) < float(expect[3]), text
         except (ValueError, TypeError):
             return False, text
     if kind == "contains":
-        return expect[1] in text, text
-    if kind == "error":
-        return False, f"期望 {expect[1]} 错误，实际成功: {text}"
+        return expect[2] in text, text
     return False, f"未知期望类型 {kind}"
 
 
@@ -662,8 +788,8 @@ def run_selftest():
     print("-" * 60)
 
     passed = failed = 0
-    for name, expr, variables, dps, expect in SELFTEST_CASES:
-        ok, detail = check_case(expr, variables, dps, expect)
+    for name, exprs, dps, expect in SELFTEST_CASES:
+        ok, detail = check_case(exprs, dps, expect)
         if ok:
             passed += 1
             print(f"  PASS  {name}")

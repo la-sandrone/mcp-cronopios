@@ -103,19 +103,25 @@ def test_calculator():
     try:
         p.start()
         assert "calculate" in p.tools(), p.tools()
-        out = p.text("calculate", {"expression": "sqrt(2)", "dps": 30})
+        out = p.text("calculate", {"exprs": {"r": "sqrt(2)"}, "dps": 30})
         assert "1.4142135623730950488016887242" in out, out
         # ln 是 log 的别名；log(x) 默认自然对数（底 e）
-        a = p.text("calculate", {"expression": "ln(10)", "dps": 25})
-        b = p.text("calculate", {"expression": "log(10)", "dps": 25})
+        a = p.text("calculate", {"exprs": {"r": "ln(10)"}, "dps": 25})
+        b = p.text("calculate", {"exprs": {"r": "log(10)"}, "dps": 25})
         assert a == b, (a, b)
         assert "2.302585092994045684017991" in a, a
+        # 名字可互相引用：按依赖序求值，与书写先后无关
+        out = p.text("calculate",
+                     {"exprs": {"y": "x*3", "x": "2", "r": "y + 1"}})
+        assert "r = 7" in out, out
+        # 互相引用成环 → 结构化错误（报出环的路径），不是崩溃
+        out = p.text("calculate", {"exprs": {"a": "b+1", "b": "a+1"}})
+        assert "CycleError" in out and "a" in out, out
         # 结构化错误（不是崩溃）
-        out = p.text("calculate", {"expression": "1 +"})
+        out = p.text("calculate", {"exprs": {"r": "1 +"}})
         assert "error" in out.lower() or "错误" in out, out
     finally:
         p.close()
-
 
 def test_entropia():
     p = Probe(SERVERS / "mcp_entropia.py")
